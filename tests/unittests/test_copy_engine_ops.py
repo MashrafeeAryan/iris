@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: MIT
 
+import importlib.util
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
 import iris
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("xio") is None,
+    reason="rocm-xio not installed (pip install iris[sdma])",
+)
 
 
 @triton.jit
@@ -90,7 +97,7 @@ def _make_grid(n, block):
 
 @pytest.mark.parametrize("num_elements", [256, 1024])
 def test_copy_engine_device_linear_put(num_elements):
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -130,7 +137,7 @@ def test_copy_engine_device_linear_put(num_elements):
 def test_copy_engine_device_linear_put_no_mask():
     num_elements = 512
     block_size = 128
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -166,7 +173,7 @@ def test_copy_engine_device_linear_put_no_mask():
 
 @pytest.mark.parametrize("num_elements", [512, 2048])
 def test_copy_engine_host_put(num_elements):
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -192,7 +199,7 @@ def test_copy_engine_host_put(num_elements):
 
 def test_copy_engine_host_put_loopback():
     """Test a host-initiated copy-engine put when source and destination are the same rank."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
 
     num_elements = 512
     src = _allocate_symmetric_range(shmem, num_elements, torch.float32)
@@ -216,9 +223,81 @@ def test_copy_engine_host_put_loopback():
     del shmem
 
 
+def _host_tile_case(shmem):
+    """A 64x96 source matrix, a zeroed destination, and a translator to the peer rank."""
+    rank = shmem.get_rank()
+    remote_rank = 1 - rank
+    src = shmem.zeros((64, 96), device="cuda", dtype=torch.float32)
+    src.copy_(torch.arange(src.numel(), dtype=torch.float32, device=src.device).reshape(src.shape))
+    dst = shmem.zeros((64, 96), device="cuda", dtype=torch.float32)
+    flag = shmem.zeros(1, device="cuda", dtype=torch.int32)
+    shmem.barrier()
+    return rank, remote_rank, src, dst, flag, lambda ptr: shmem.heap.translate(ptr, rank, remote_rank)
+
+
+def test_copy_engine_host_put_tile():
+    """A strided sub-tile lands at the same offset on the peer, and nothing else is written."""
+    shmem = iris.iris(1 << 22, engines=("sdma",))
+    _require_two_ranks(shmem)
+    rank, remote_rank, src, dst, flag, to_peer = _host_tile_case(shmem)
+
+    if rank == 0:
+        shmem.put_tile(
+            src[16, 24].data_ptr(),
+            to_rank=remote_rank,
+            dst_addr=to_peer(dst[16, 24].data_ptr()),
+            data_size=src.element_size(),
+            tile_height=32,
+            tile_width=48,
+            src_stride=src.stride(0),
+            dst_stride=dst.stride(0),
+            signal_flag=to_peer(flag.data_ptr()),
+        )
+    shmem.barrier()
+
+    if rank == 1:
+        expected = torch.zeros_like(dst)
+        expected[16:48, 24:72] = src[16:48, 24:72]
+        assert flag.item() == 1
+        torch.testing.assert_close(dst, expected, rtol=0, atol=0)
+    shmem.barrier()
+    del shmem
+
+
+def test_copy_engine_host_put_tiles():
+    """Two tiles of different shapes in one batch, then one signal."""
+    shmem = iris.iris(1 << 22, engines=("sdma",))
+    _require_two_ranks(shmem)
+    rank, remote_rank, src, dst, flag, to_peer = _host_tile_case(shmem)
+    corners, shapes = [(0, 0), (40, 64)], [(8, 16), (24, 32)]
+
+    if rank == 0:
+        shmem.put_tiles(
+            [src[r, c].data_ptr() for r, c in corners],
+            to_rank=remote_rank,
+            dst_addrs=[to_peer(dst[r, c].data_ptr()) for r, c in corners],
+            data_size=src.element_size(),
+            tile_heights=[h for h, _ in shapes],
+            tile_widths=[w for _, w in shapes],
+            src_strides=[src.stride(0)] * 2,
+            dst_strides=[dst.stride(0)] * 2,
+            signal_flag=to_peer(flag.data_ptr()),
+        )
+    shmem.barrier()
+
+    if rank == 1:
+        expected = torch.zeros_like(dst)
+        for (r, c), (h, w) in zip(corners, shapes):
+            expected[r : r + h, c : c + w] = src[r : r + h, c : c + w]
+        assert flag.item() == 1
+        torch.testing.assert_close(dst, expected, rtol=0, atol=0)
+    shmem.barrier()
+    del shmem
+
+
 def test_copy_engine_device_linear_put_loopback():
     """Test a device-initiated copy-engine put when source and destination share one rank."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
 
     rank = shmem.get_rank()
     num_elements = 256
@@ -271,7 +350,7 @@ def _copy_engine_atomic_kernel(
 # For int64, adding to 0xFFFFFFFF carries into the upper dword only if the SDMA add is 64-bit.
 @pytest.mark.parametrize("dtype, initial", [(torch.int32, 0), (torch.int64, 0xFFFFFFFF)])
 def test_copy_engine_atomic_add(dtype, initial):
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -327,7 +406,7 @@ def _copy_engine_atomic_cas_kernel(
 
 
 def test_copy_engine_atomic_cas():
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -449,7 +528,7 @@ def _copy_engine_2d_no_mask_kernel(
 @pytest.mark.parametrize("M,N", [(16, 16), (32, 64)])
 def test_copy_engine_2d_tiled(M, N):
     """Test 2D tiled copy with strides."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -492,7 +571,7 @@ def test_copy_engine_2d_tiled(M, N):
 
 def test_copy_engine_2d_tiled_no_mask():
     """Test full-tile 2D copy using shape-inferred SDMA packet size."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -579,7 +658,7 @@ def _copy_engine_put_signal_kernel(
 
 def test_copy_engine_put_with_signal():
     """Test copy followed by atomic signal."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -667,7 +746,7 @@ def _copy_engine_multi_block_kernel(
 @pytest.mark.parametrize("num_blocks", [4, 8])
 def test_copy_engine_multi_block_concurrent(num_blocks):
     """Test multiple workgroups using copy engine concurrently."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -712,7 +791,7 @@ def test_copy_engine_multi_block_concurrent(num_blocks):
 
 def test_copy_engine_zero_size():
     """Test copy engine with zero-size transfer (should be no-op)."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -738,7 +817,7 @@ def test_copy_engine_zero_size():
 
 def test_copy_engine_device_zero_size():
     """Test device-side copy engine puts with fully-masked tiles (should be no-op)."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -792,7 +871,7 @@ def test_copy_engine_device_zero_size():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int32])
 def test_copy_engine_different_dtypes(dtype):
     """Test copy engine with different data types."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()
@@ -831,7 +910,7 @@ def test_copy_engine_different_dtypes(dtype):
 
 def test_copy_engine_bidirectional():
     """Test both ranks doing copy engine operations simultaneously."""
-    shmem = iris.iris(1 << 20)
+    shmem = iris.iris(1 << 20, engines=("sdma",))
     _require_two_ranks(shmem)
 
     rank = shmem.get_rank()

@@ -30,12 +30,12 @@ jobs:
     # The upstream self-hosted GPU pool is not available on contributor forks.
     if: github.repository == 'ROCm/iris'
     runs-on: [linux-mi350-8gpu-iris]
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -53,9 +53,6 @@ jobs:
       - name: Build Iris container
         run: bash .github/scripts/container_build.sh
 
-      - name: Acquire GPUs
-        run: bash .github/scripts/acquire_gpus.sh 8
-
       - name: Record environment
         run: |
           bash .github/scripts/report_versions.sh
@@ -63,8 +60,13 @@ jobs:
 
       - name: Benchmark base and PR on 2, 4 and 8 ranks
         run: |
-          bash .github/scripts/container_exec.sh --gpus "$GPU_DEVICES" \
-            "bash .github/scripts/run_workspace_benchmark.sh"
+          # The queue runs in a temporary checkout; preserve artifacts before
+          # it removes that checkout, including results from a failed sweep.
+          python3 .github/scripts/gpu_task_queue.py --task 8 "Workspace reuse benchmark" \
+            'bash .github/scripts/container_exec.sh --gpus "$GPU_DEVICES" "bash .github/scripts/run_workspace_benchmark.sh"; rc=$?
+             mkdir -p "$GITHUB_WORKSPACE/.workspace_benchmark/results"
+             cp -r .workspace_benchmark/results/. "$GITHUB_WORKSPACE/.workspace_benchmark/results/" || rc=$?
+             exit "$rc"'
 
       - name: Publish comparison
         if: always()
@@ -75,7 +77,7 @@ jobs:
 
       - name: Upload measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: matmul-workspace-${{ github.run_id }}
           path: .workspace_benchmark/results/

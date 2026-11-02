@@ -3,6 +3,7 @@ subtrees:
   - caption: Getting Started
     entries:
     - file: getting-started/installation.md
+    - file: getting-started/slurm.md
     - file: reference/examples.md
     - file: CONTRIBUTING.md
   - caption: Conceptual
@@ -10,6 +11,7 @@ subtrees:
     - file: conceptual/programming-model.md
     - file: conceptual/finegrained-overlap.md
     - file: conceptual/taxonomy.md
+    - file: conceptual/triggered-plans.md
   - caption: Reference
     entries:
     - file: reference/talks-and-papers.md
@@ -18,9 +20,13 @@ subtrees:
       - file: reference/host/class.md
       - file: reference/host/tensor-creation.md
       - file: reference/host/ccl.md
+      - file: reference/host/copy-engine.md
+      - file: reference/host/plan.md
       - file: reference/triton/overview.md
         entries:
+        - file: reference/triton/device-context.md
         - file: reference/triton/device-functions.md
+        - file: reference/triton/types.md
         - file: reference/triton/ops.md
       - file: reference/gluon/overview.md
         entries:

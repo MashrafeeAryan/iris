@@ -2,7 +2,9 @@
 # Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 
 
+import itertools
 import logging
+import socket
 
 import torch
 import torch.distributed as dist
@@ -11,6 +13,47 @@ import triton
 import triton.language as tl
 from iris.host.logging.logging import _log_rank
 from iris.host.tracing.kernel_artifacts import iris_launch
+
+_gpu_exchanges = itertools.count(1)
+
+
+def _gpu_key(device_id):
+    props = torch.cuda.get_device_properties(device_id)
+    return f"{socket.gethostname()}/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}"
+
+
+def rank_gpu_ordinals(device_id, num_ranks):
+    """
+    Each rank's GPU as a device ordinal in this process, or None where this process cannot see it.
+
+    Collective. GPUs are matched by host and PCI address, because a device ordinal names a different
+    GPU in each process whose HIP_VISIBLE_DEVICES differs. Exchanged through the rendezvous store, so
+    no NCCL collective is issued.
+    """
+    if num_ranks == 1:
+        return [device_id]
+    store = dist.distributed_c10d._get_default_store()
+    prefix = f"iris_gpu_v{next(_gpu_exchanges)}/"
+    store.set(f"{prefix}{dist.get_rank()}", _gpu_key(device_id))
+    local = {_gpu_key(i): i for i in range(torch.cuda.device_count())}
+    return [local.get(store.get(f"{prefix}{r}").decode("utf-8")) for r in range(num_ranks)]
+
+
+def require_process_group_device(gpu_id, device_given):
+    """
+    Raise if the default process group is bound to a GPU other than ``gpu_id``.
+
+    Iris runs its collectives on ``gpu_id``, and NCCL rejects collectives on a GPU other than the one the
+    process group was bound to with ``init_process_group(device_id=...)``. Unbound groups are not checked.
+    """
+    bound = getattr(dist.distributed_c10d._get_default_group(), "bound_device_id", None)
+    if bound is None or bound.index is None or bound.index == gpu_id:
+        return
+    if device_given:
+        hint = f"device= must be the GPU the process group is bound to; pass device={bound.index}."
+    else:
+        hint = f"Iris defaults to GPU rank % visible GPUs; pass device={bound.index} to run on the bound GPU."
+    raise ValueError(f"Iris would run on GPU {gpu_id}, but the process group is bound to {bound}. {hint}")
 
 
 def _infer_device():
@@ -335,10 +378,12 @@ def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
 def _device_barrier_kernel(
     flags_ptr,
     iris_rank,
+    num_ranks,
     world_size: tl.constexpr,
     rank_start,
     rank_stride,
     heap_bases,
+    BLOCK: tl.constexpr,
     MAX_SPINS: tl.constexpr = 1_000_000_000,
 ):
     """
@@ -346,39 +391,38 @@ def _device_barrier_kernel(
     CUDA graph capturable.
 
     Stateless w.r.t. host-side epoch tracking: there is no CPU-side epoch
-    counter. Each rank's flag on the heap serves as its own epoch counter,
-    managed entirely by the GPU via atomic_add. A persistent per-group flags
-    tensor is cached in ``_device_barrier_state``.
+    counter. ``flags`` is a (num_ranks, num_ranks) table of pairwise
+    counters; entry [r, j] counts the barriers rank r has entered whose
+    group contains rank j. Only rank r writes row r, on its own heap.
+    Counting per pair rather than per rank lets one table serve every
+    group: a barrier over one group does not advance the counters that
+    ranks outside it wait on.
 
-    Launched with grid=(1,). A single CTA:
-    1. Atomically increments its own flag (atomic_add, release)
-    2. Serially polls each remote rank's flag for the same value (acquire)
+    Launched with grid=(1,). A single CTA, one lane per peer:
+    1. Atomically increments its counter for every peer in the group (atomic_add, release)
+    2. Polls every peer's counter for this rank until all have caught up (acquire)
     """
-    # Increment own flag and determine target
-    own_flag_ptr = flags_ptr + iris_rank
-    own_translated = _translate_ptr(own_flag_ptr, iris_rank, iris_rank, heap_bases)
-    old = tl.atomic_add(own_translated, 1, sem="release", scope="sys")
-    target = old + 1
+    # Every extra CTA would bump the counters again and desynchronize the ranks.
+    if tl.program_id(0) != 0:
+        return
 
-    # Poll each remote rank serially
-    for i in range(world_size):
-        remote_rank = rank_start + i * rank_stride
-        if remote_rank != iris_rank:
-            remote_flag_ptr = flags_ptr + remote_rank
-            remote_translated = _translate_ptr(remote_flag_ptr, iris_rank, remote_rank, heap_bases)
-            spin_count = 0
-            while (
-                tl.atomic_cas(
-                    remote_translated,
-                    target,
-                    target,
-                    sem="acquire",
-                    scope="sys",
-                )
-                < target
-            ):
-                spin_count += 1
-                tl.device_assert(spin_count < MAX_SPINS, "device_barrier: timeout")
+    offsets = tl.arange(0, BLOCK)
+    peers = rank_start + offsets * rank_stride
+    is_peer = (offsets < world_size) & (peers != iris_rank)
+    # Lanes that are not peers point at this rank so that every address stays in range.
+    peers = tl.where(is_peer, peers, iris_rank)
+
+    own_row = flags_ptr + iris_rank * num_ranks
+    targets = tl.atomic_add(own_row + peers, 1, mask=is_peer, sem="release", scope="sys") + 1
+
+    remote_ptrs = _translate_ptr(flags_ptr + peers * num_ranks + iris_rank, iris_rank, peers, heap_bases)
+    pending = is_peer
+    spin_count = 0
+    while tl.max(pending.to(tl.int32), axis=0) > 0:
+        seen = tl.atomic_add(remote_ptrs, 0, mask=pending, sem="acquire", scope="sys")
+        pending = pending & (seen < targets)
+        spin_count += 1
+        tl.device_assert(spin_count < MAX_SPINS, "device_barrier: timeout")
 
 
 def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
@@ -390,13 +434,13 @@ def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
     this launches a single-CTA Triton kernel that synchronizes via
     device-side atomics, making it safe to use during CUDA graph capture.
 
-    Stateless w.r.t. host-side epoch tracking: each rank's flag on the
-    symmetric heap serves as its own epoch counter, managed entirely by
-    the GPU via atomic_add. A persistent per-group flags tensor is cached
-    in ``_device_barrier_state``.
+    Stateless w.r.t. host-side epoch tracking: ``flags`` holds pairwise
+    counters managed entirely by the GPU via atomic_add, and one table
+    serves every process group, so nothing is allocated per call or per group.
 
     Args:
-        flags: int32 tensor on symmetric heap, one element per rank.
+        flags: int32 tensor of shape (num_ranks, num_ranks) on the symmetric heap,
+            zero-initialized and allocated collectively by all ranks.
         group: ProcessGroup or None. If None, uses all ranks.
         rank: Global rank of this process.
         num_ranks: Total number of ranks in the default group.
@@ -408,10 +452,12 @@ def distributed_device_barrier(flags, group, rank, num_ranks, heap_bases):
         (1,),
         flags,
         rank_global,
+        num_ranks,
         world_size,
         rank_start,
         rank_stride,
         heap_bases,
+        triton.next_power_of_2(world_size),
         algorithm="barrier",
         rank=rank_global,
     )

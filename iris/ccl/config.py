@@ -31,10 +31,13 @@ class Config:
         num_xcds: Number of XCCs. If None, auto-detected from system (default: None)
         use_gluon: If True, use Gluon-based implementation (default: False)
                    Gluon provides better control over warp-level traffic shaping
-        all_gather_variant: Variant for all-gather operation (default: "persistent")
-                           Options: "persistent", "partitioned"
+        all_gather_variant: Variant for all-gather operation (default: None, which means
+                           "persistent" for the CU kernels)
+                           Options: "persistent", "partitioned", "tdm"
                            - "persistent": Each PID handles multiple tiles and sends to all ranks
                            - "partitioned": PIDs partitioned across ranks, eliminates inner loop
+                           - "tdm": Gluon only, gfx1250 only. Moves tiles with the tensor data
+                             movement engine: one HBM->LDS load and one LDS->peer store per rank
         all_reduce_variant: Variant for all-reduce operation (default: "atomic")
                            Options: "atomic", "ring", "two_shot", "one_shot", "spinlock"
         all_reduce_distribution: Distribution for two-shot all-reduce (default: 0)
@@ -44,16 +47,22 @@ class Config:
                                  (default: auto-set to block_size_n // world_size at runtime)
         reduce_scatter_variant: Variant for reduce-scatter operation (default: "two_shot")
                                 Only "two_shot" is supported
-        num_stages: Number of pipeline stages for the kernel (default: 1)
+        num_stages: Number of pipeline stages for the kernel (default: 1). For the TDM
+                    all-gather, the number of tiles each workgroup keeps in LDS: loads run
+                    num_stages - 1 tiles ahead of stores, and num_stages x block_size_m x
+                    block_size_n elements must fit in LDS
         num_warps: Number of warps per workgroup (default: 4). For gluon kernels,
-                   this also sets WARPS_PER_CTA in the BlockedLayout. The product
-                   threads_per_warp * num_warps determines the minimum tile size
+                   this also sets the warps of the BlockedLayout. The product of
+                   the wavefront width (64 on CDNA3/4, 32 on CDNA5, read in-kernel)
+                   and num_warps determines the minimum tile size
                    (block_size_m * block_size_n for flat-2D, or block_size_n for 1D).
-        threads_per_warp: Threads per warp/wavefront (default: 64). Must match the
-                          hardware wavefront size: 64 for AMD GPUs, 32 for NVIDIA.
-                          Used by gluon kernels to construct BlockedLayout for
-                          vectorized memory access.
         waves_per_eu: Waves per execution unit hint for occupancy (default: 0, auto)
+        engine: What moves the data (default: "cu")
+                Options: "cu", "sdma"
+                - "cu": Compute-unit kernels load and store the data
+                - "sdma": Copy engines move the data; needs a context created with
+                  engines=("sdma",). all_gather only; use_gluon and all_gather_variant must be
+                  left unset, and the tiling fields are unused
 
     Example:
         >>> import iris
@@ -75,6 +84,11 @@ class Config:
         >>> # All-gather with partitioned variant
         >>> config = Config(all_gather_variant="partitioned")
         >>> ctx.ccl.all_gather(output_tensor, input_tensor, config=config)
+
+        >>> # All-gather on the SDMA copy engines
+        >>> ctx = iris.iris(engines=("sdma",))
+        >>> config = Config(engine="sdma")
+        >>> ctx.ccl.all_gather(output_tensor, input_tensor, config=config)
     """
 
     block_size_m: int = 32
@@ -84,7 +98,7 @@ class Config:
     num_xcds: int | None = None
     chunk_size: int | None = None
     use_gluon: bool = False
-    all_gather_variant: str = "persistent"
+    all_gather_variant: str | None = None
     all_reduce_variant: str = "two_shot"
     all_reduce_distribution: int = 1
     all_reduce_num_rings: int = 1
@@ -92,8 +106,8 @@ class Config:
     reduce_scatter_variant: str = "two_shot"
     num_stages: int = 1
     num_warps: int = 4
-    threads_per_warp: int = 64
     waves_per_eu: int = 0
+    engine: str = "cu"
 
     def __post_init__(self):
         """Validate and auto-detect num_xcds if not set."""
@@ -114,10 +128,16 @@ class Config:
             raise ValueError(f"comm_sms must be positive, got {self.comm_sms}")
         if self.num_xcds <= 0:
             raise ValueError(f"num_xcds must be positive, got {self.num_xcds}")
-        if self.all_gather_variant not in ["persistent", "partitioned"]:
+        if self.num_stages <= 0:
+            raise ValueError(f"num_stages must be positive, got {self.num_stages}")
+        if self.engine not in ["cu", "sdma"]:
+            raise ValueError(f"engine must be one of: 'cu', 'sdma', got {self.engine}")
+        if self.all_gather_variant not in [None, "persistent", "partitioned", "tdm"]:
             raise ValueError(
-                f"all_gather_variant must be one of: 'persistent', 'partitioned', got {self.all_gather_variant}"
+                f"all_gather_variant must be one of: 'persistent', 'partitioned', 'tdm', got {self.all_gather_variant}"
             )
+        if self.all_gather_variant == "tdm" and not self.use_gluon:
+            raise ValueError("all_gather_variant='tdm' is a Gluon kernel; set use_gluon=True")
         if self.all_reduce_variant not in ["atomic", "ring", "two_shot", "one_shot", "spinlock"]:
             raise ValueError(
                 f"all_reduce_variant must be one of: 'atomic', 'ring', 'two_shot', 'one_shot', 'spinlock', got {self.all_reduce_variant}"
@@ -144,7 +164,5 @@ class Config:
         if self.reduce_scatter_variant != "two_shot":
             raise ValueError(f"reduce_scatter_variant must be 'two_shot', got '{self.reduce_scatter_variant}'")
 
-        if self.threads_per_warp not in (32, 64):
-            raise ValueError(f"threads_per_warp must be 32 (NVIDIA) or 64 (AMD), got {self.threads_per_warp}")
         if self.num_warps <= 0:
             raise ValueError(f"num_warps must be positive, got {self.num_warps}")

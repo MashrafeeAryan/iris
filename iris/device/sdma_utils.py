@@ -11,8 +11,28 @@ and submission operations.
 
 import triton
 import triton.language as tl
-from xio import sdma_ep
 from iris.mem.utils import wait_cnt
+
+sdma_ep = None
+
+
+def bind_sdma_ep():
+    """Import rocm-xio and bind ``sdma_ep`` for the SDMA device functions."""
+    global sdma_ep
+    if sdma_ep is None:
+        try:
+            from xio import sdma_ep as imported
+        except ModuleNotFoundError as exc:
+            if exc.name != "xio":
+                raise
+            raise ModuleNotFoundError(
+                "rocm-xio is required for the SDMA copy engine. "
+                'Install it with `pip install iris[sdma]`, or drop "sdma" from engines '
+                "to use shader load/store only.",
+                name="xio",
+            ) from exc
+        sdma_ep = imported
+    return sdma_ep
 
 
 @triton.jit
@@ -217,6 +237,35 @@ def place_copy_packet(queue_ptr_u32, offset_bytes: tl.uint64, size_bytes: tl.uin
     tl.store(slot_ptr_u32 + 5, dst_ptr_val.to(tl.uint32), cache_modifier=".wt")
     # offset 6: dst address 63:32
     tl.store(slot_ptr_u32 + 6, (dst_ptr_val >> 32).to(tl.uint32), cache_modifier=".wt")
+
+
+@triton.jit
+def copy_linear(copy_engine_ctx, to_rank, src, dst, nbytes):
+    """
+    Queue one COPY_LINEAR of ``nbytes`` from address ``src`` to address ``dst`` on this rank's
+    device-initiated queue to ``to_rank``. ``nbytes`` is at most 1 GiB (a 30-bit count on SDMA 4.4).
+    """
+    handle = copy_engine_ctx + sdma_ep.QUEUE_DEVICE_CTX_SIZE * to_rank
+    queue_ptr_u32 = tl.load(handle + 0).to(tl.pointer_type(tl.uint32))
+    read_ptr = tl.load(handle + 1).to(tl.pointer_type(tl.uint64))
+    write_ptr = tl.load(handle + 2).to(tl.pointer_type(tl.uint64))
+    doorbell_ptr = tl.load(handle + 3).to(tl.pointer_type(tl.uint64))
+    cached_write_ptr = tl.load(handle + 4).to(tl.pointer_type(tl.uint64))
+    committed_write_ptr = tl.load(handle + 5).to(tl.pointer_type(tl.uint64))
+
+    command_in_bytes = sdma_ep.COPY_LINEAR_COMMAND_BYTES
+    base, offset = acquire_fadd(
+        queue_ptr_u32,
+        read_ptr,
+        write_ptr,
+        doorbell_ptr,
+        cached_write_ptr,
+        committed_write_ptr,
+        command_in_bytes,
+    )
+    place_nop_packet(queue_ptr_u32, base, offset)
+    place_copy_packet(queue_ptr_u32, base + offset, nbytes.to(tl.uint32), src, dst)
+    submit(write_ptr, doorbell_ptr, committed_write_ptr, base, base + offset + command_in_bytes)
 
 
 # atomic op codes and operation
