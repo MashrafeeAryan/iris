@@ -296,11 +296,14 @@ def _agree_workspace(shmem, A, B, config, workspace, *, check_capacity):
         config.block_size_n,
         config.block_size_k,
     )
+    error = _lock_capacity_error(shmem, A, B, config, workspace) if check_capacity else None
+    if config.all_reduce_variant == "ring":
+        error = "The ring variant is not implemented by matmul_all_reduce. Use atomic, spinlock, one_shot, or two_shot."
     local_state = {
         "parameters": parameters,
         "needs_allocation": needs_allocation,
         "offsets": None if needs_allocation else _workspace_offsets(shmem, workspace),
-        "error": _lock_capacity_error(shmem, A, B, config, workspace) if check_capacity else None,
+        "error": error,
         "generation": None if needs_allocation else workspace.generation,
     }
     states = _gather_workspace_states(shmem, local_state)

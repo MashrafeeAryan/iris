@@ -195,7 +195,8 @@ def test_matmul_all_reduce_lock_too_small():
     gc.collect()
 
 
-def test_workspace_reallocation_is_collective(monkeypatch):
+@pytest.mark.parametrize("invalidation", ["shape", "missing", "generation_wrap"])
+def test_workspace_reallocation_is_collective(monkeypatch, invalidation):
     """Rebuild on every rank when only one rank has mismatched metadata."""
     from iris.ops import FusedConfig
 
@@ -210,7 +211,12 @@ def test_workspace_reallocation_is_collective(monkeypatch):
     config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, all_reduce_variant="one_shot")
     workspace = ops.matmul_all_reduce(shmem, C, A, B, config=config)
     if shmem.get_rank() == 0:
-        workspace.shape = (128, 128, 64)
+        if invalidation == "shape":
+            workspace.shape = (128, 128, 64)
+        elif invalidation == "missing":
+            workspace = None
+        else:
+            workspace.generation = 2**31 - 1
 
     allocations = []
     original_zeros = shmem.zeros
@@ -224,6 +230,71 @@ def test_workspace_reallocation_is_collective(monkeypatch):
     assert allocations
     assert workspace.shape == (128, 128, 32)
     torch.testing.assert_close(C, torch.full_like(C, 32 * shmem.get_num_ranks()))
+    shmem.barrier()
+
+
+@pytest.mark.parametrize("variant", ["one_shot", "two_shot"])
+def test_matmul_all_reduce_transposed_output(variant):
+    """Auxiliary storage remains contiguous when the output uses different strides."""
+    from iris.ops import FusedConfig
+
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    shmem = iris.iris(1 << 26)
+    device = shmem.get_device()
+    A = torch.randn((128, 32), device=device, dtype=torch.float16)
+    B = torch.randn((32, 256), device=device, dtype=torch.float16)
+    C = shmem.zeros((256, 128), dtype=torch.float16).t()
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, all_reduce_variant=variant)
+    reference = torch.matmul(A, B)
+    dist.all_reduce(reference)
+    workspace = None
+    for _ in range(2):
+        workspace = ops.matmul_all_reduce(shmem, C, A, B, config=config, workspace=workspace)
+        torch.testing.assert_close(C, reference, atol=0.2, rtol=0.02)
+    shmem.barrier()
+
+
+def test_workspace_generation_disagreement_is_collective():
+    """Every rank must reject mismatched live generations before a kernel launches."""
+    from iris.ops import FusedConfig
+
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+    if dist.get_world_size() < 2:
+        pytest.skip("Requires at least two ranks to disagree")
+
+    shmem = iris.iris(1 << 26)
+    device = shmem.get_device()
+    A = torch.ones((128, 32), device=device, dtype=torch.float16)
+    B = torch.ones((32, 128), device=device, dtype=torch.float16)
+    C = shmem.zeros((128, 128), dtype=torch.float16)
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, all_reduce_variant="one_shot")
+    workspace = ops.matmul_all_reduce(shmem, C, A, B, config=config)
+    if shmem.get_rank() == 0:
+        workspace.generation += 1
+    with pytest.raises(ValueError, match="Workspace generations differ"):
+        ops.matmul_all_reduce(shmem, C, A, B, config=config, workspace=workspace)
+    shmem.barrier()
+
+
+def test_matmul_all_reduce_rejects_unsupported_ring():
+    """The shared configuration accepts ring, but this fused kernel cannot execute it."""
+    from iris.ops import FusedConfig
+
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    shmem = iris.iris(1 << 26)
+    device = shmem.get_device()
+    A = torch.ones((128, 32), device=device, dtype=torch.float16)
+    B = torch.ones((32, 128), device=device, dtype=torch.float16)
+    C = shmem.zeros((128, 128), dtype=torch.float16)
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, all_reduce_variant="ring")
+    for operation in (ops.matmul_all_reduce_preamble, ops.matmul_all_reduce):
+        with pytest.raises(ValueError, match="ring variant is not implemented"):
+            operation(shmem, C, A, B, config=config)
     shmem.barrier()
 
 
